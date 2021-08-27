@@ -1,0 +1,217 @@
+@startuml 山东意外险消息处理
+' !theme amiga 
+' 声明数据库
+database "山东意外险消息表\n(t_reg_mq_sd_message)" as 山东意外险消息表
+
+' 声明消息发布者
+queue "承保域消息队列\n(TP_CIC_MIDPROPOSAL_POLICY_CHANGE)" as 承保域消息队列
+queue "批改域消息队列\n(TP_CIC_MIDENDORSE_CORE_ORDINARY)" as 批改域消息队列
+
+' 声明普通节点 
+participant "消息监听\n(RiskWarningMessageListener.consume)" as 消息监听
+participant "消息消费\n(ConsumeServiceImpl.consumeMessage)" as 消息消费
+participant "失败消息定时任务\n(TaskFailMessageServiceImpl.handle)" as 失败消息定时任务
+participant "消息处理\n(ConsumeServiceImpl.messageDealWith)" as 消息处理
+participant "解析消息\n(ConsumeServiceImpl.consumeMessagePolicy)" as 解析消息
+
+participant "承保域消息处理\n(ConsumeServiceImpl.consumeMessagePolicy)" as 承保域消息处理
+participant "批改域消息处理\n(ConsumeServiceImpl.consumeMessageEndorsement)" as 批改域消息处理
+
+participant "承保域保单查询服务\n(ApplyFacade.query)" as 承保域保单查询服务
+    note left of 承保域保单查询服务
+            <dependency>
+                <groupId>com.aliyun.fsi.insurance.proposal</groupId>
+                <artifactId>proposal-apply-core-facade</artifactId>
+                <version>1.0-2021-07-19-SNAPSHOT</version>
+                <exclusions>
+                    <exclusion>
+                        <groupId>*</groupId>
+                        <artifactId>*</artifactId>
+                    </exclusion>
+                </exclusions>
+            </dependency>
+            <dependency>
+                <groupId>com.aliyun.fsi.insurance</groupId>
+                <artifactId>insurance-shared-facade</artifactId>
+                <version>1.0.0</version>
+                <scope>compile</scope>
+            </dependency>
+    end note
+participant "批改域批单查询服务\n(EndorsementApplySearchRpcFacade.queryEndorsementOrderCombinationPolicy)" as 批改域批单查询服务
+    note right of 批改域批单查询服务
+            <dependency>
+                <groupId>com.aliyun.fsi.insurance.proposal.endorsement</groupId>
+                <artifactId>endorsement-core-facade</artifactId>
+                <version>8.0-20210830-SNAPSHOT</version>
+            </dependency>
+    end note
+
+participant "是否上传\n(ConsumeServiceImpl.needUploadPolicyGenerate)" as 判断是否上传
+participant "转换层\n(ConvertServiceImpl.*)" as 转换层
+
+participant "拆单合并单\n(ConvertServiceImpl.policyAssemblePolicyRegister)" as 拆单合并单
+
+participant "山东意外险平台\n(SinoServiceImpl.request)" as 山东意外险平台
+note left of 山东意外险平台
+            <dependency>
+                <groupId>com.cic.businsurance.regulatory</groupId>
+                <artifactId>acci-sd-riskwaring-facade</artifactId>
+                <version>${revision}</version>
+            </dependency>
+end note  
+
+group cic-busreg-acci-sd-riskwarningmq 山东意外险消息消费服务
+    ' 正常消费流程开始
+    group 消息发送
+    承保域消息队列 -> 消息监听 : 广播承保域消息
+    批改域消息队列 -> 消息监听 : 广播批改域消息
+    end
+
+    group 消息监听消费
+    消息监听 -> 消息消费 : 消费承保域消息
+    消息监听 -> 消息消费 : 消费批改域消息
+    end
+
+    ' 定时任务开始
+    group cic-busreg-acci-sd-riskwarningtask 定时扫描失败消息服务
+    失败消息定时任务 -> 山东意外险消息表 : 扫描获取状态为失败 且失败次数小于三次的消息
+    失败消息定时任务 <- 山东意外险消息表 : 返回符合条件的失败消息数据库对象集合
+
+    失败消息定时任务 -> 消息处理 : 拼接消息的json字符串以及当前失败重试次数
+    end
+    note right : 每十分钟扫描一次
+
+    消息消费 -> 消息处理 : 对初次消费的消息进行处理
+
+    消息处理 -> 解析消息 : 传入Message消息对象\n及消息的初始化重试次数\n第一次默认为0
+
+    解析消息 -> 承保域消息处理 : 承保域消息处理
+    解析消息 -> 批改域消息处理 : 批改域消息处理
+
+    ' 回调查询
+    group 承保域回调
+    承保域消息处理 -> 承保域保单查询服务 : 查询保单信息
+        alt 查询保单信息成功
+            承保域消息处理 <- 承保域保单查询服务 : 返回保单信息
+        else 查询保单信息失败
+            承保域消息处理 <- 承保域保单查询服务 : 查询失败
+            山东意外险消息表 <- 承保域消息处理 : 回调承保域保单信息查询失败的消息入库 记录状态为失败 初始化失败重试次数0或递增失败次数
+        end
+    end
+
+    group 批改域回调 
+    批改域消息处理 -> 批改域批单查询服务 : 查询批单信息
+        alt 查询批单信息成功
+            批改域消息处理 <- 批改域批单查询服务 : 返回批单信息
+        else 查询批单信息失败
+            批改域消息处理 <- 批改域批单查询服务 : 查询失败
+            山东意外险消息表 <- 批改域消息处理 : 回调批改域批单信息查询失败的消息入库 记录状态为失败 初始化失败重试次数0或递增失败次数
+        end
+    end
+
+    ' 承保域拆单 合并上传
+    group 承保域拆单合并上传
+    承保域消息处理 -> 判断是否上传 : 根据docStatus节点及业务条件判断
+        alt 需要上传
+            承保域消息处理 <- 判断是否上传 : 需要上传
+        else 承保域无需上传的消息
+            承保域消息处理 <- 判断是否上传 : 无需上传
+            山东意外险消息表 <- 承保域消息处理 : 承保域无需上传的消息的消息入库并记录状态为成功
+        end
+
+    承保域消息处理 -> 转换层 : 进行字段码值转换
+    承保域消息处理 <- 转换层 : 返回转换后保单对象
+
+    承保域消息处理 -> 拆单合并单 : 转换后保单对象
+    note left
+    根据被保人数量
+    判断是否需要拆单
+    end note
+        alt 不需要拆单
+            承保域消息处理 <- 拆单合并单 : 转换为报送平台对象
+            承保域消息处理 -> 山东意外险平台 : 报送山东意外险平台
+        else 需要拆单
+            承保域消息处理 <- 拆单合并单 : 转换为报送平台对象集合
+            承保域消息处理 -> 承保域消息处理 : 循环取出保单对象集合
+            note left : 单次最多上报200个保单
+            承保域消息处理 -> 山东意外险平台 : 循环报送山东意外险平台
+        end
+    end
+
+    ' 批改域拆单 合并上传
+    group 批改域拆单合并上传
+    批改域消息处理 -> 判断是否上传 : 根据业务条件判断
+        alt 需要上传
+            批改域消息处理 <- 判断是否上传 : 需要上传
+        else 批改域无需上传的消息
+            批改域消息处理 <- 判断是否上传 : 无需上传
+            山东意外险消息表 <- 批改域消息处理 : 批改域无需上传的消息的消息入库并记录状态为成功
+        end
+
+        批改域消息处理 -> 转换层 : 进行字段码值转换
+            alt 转换为保单对象
+                批改域消息处理 <- 转换层 : 返回转换后保单对象
+
+                批改域消息处理 -> 拆单合并单 : 转换后保单对象
+                note left
+                根据被保人数量
+                判断是否需要拆单
+                end note
+                    alt 不需要拆单
+                        批改域消息处理 <- 拆单合并单 : 转换为报送平台对象
+                        批改域消息处理 -> 山东意外险平台 : 报送山东意外险平台
+                    else 需要拆单
+                        批改域消息处理 <- 拆单合并单 : 转换为报送平台对象集合
+                        批改域消息处理 -> 批改域消息处理 : 循环取出保单对象集合
+                        note left : 单次最多上报200个保单
+                        批改域消息处理 -> 山东意外险平台 : 循环报送山东意外险平台
+                    end
+            else 转换为保单撤销对象
+                批改域消息处理 <- 转换层 : 返回转换后保单撤销对象
+                批改域消息处理 -> 山东意外险平台 : 报送山东意外险平台
+            end
+    end
+
+    ' 上报山东意外险平台返回结果
+    group 山东意外险平台返回结果处理
+    承保域消息处理 <- 山东意外险平台 : 返回报送结果
+        alt 报送成功
+            承保域消息处理 -> 山东意外险消息表 : 消息入库并记录状态为成功
+        else 报送失败
+            承保域消息处理 -> 山东意外险消息表 : 消息入库并记录状态为失败 初始化失败重试次数0或递增失败次数
+        end
+    批改域消息处理 <- 山东意外险平台 : 返回报送结果
+        alt 报送成功
+            批改域消息处理 -> 山东意外险消息表 : 消息入库并记录状态为成功
+        else 报送失败
+            批改域消息处理 -> 山东意外险消息表 : 消息入库并记录状态为失败 初始化失败重试次数0或递增失败次数
+        end
+    end
+
+    解析消息 <- 承保域消息处理 : 消息消费结果
+    解析消息 <- 批改域消息处理 : 消息消费结果
+
+    group 不属于山东意外险平台消息
+    解析消息 -> 山东意外险消息表 : 不属于山东意外险平台的消息入库并记录状态为成功
+    山东意外险消息表 -> 解析消息 :消息消费成功 可以销毁
+    end
+
+    解析消息 <- 承保域消息处理 : 消息消费结果
+    解析消息 <- 批改域消息处理 : 消息消费结果
+
+    消息处理 <- 解析消息 : 消息消费结果
+    消息消费 <- 消息处理 : 消息消费结果
+
+    group 返回消息消费结果
+    消息消费 -> 消息监听: 承保域消息消费结果
+    消息消费 -> 消息监听 : 批改域消息消费结果
+    end
+
+    group 销毁已消费消息
+    消息监听 -> 承保域消息队列 : 删除已消费消息
+    消息监听 -> 批改域消息队列 : 删除已消费消息
+    end
+
+end
+
+@enduml
